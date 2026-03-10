@@ -55,10 +55,22 @@ func (b *Bridge) Start(ctx context.Context) error {
 		b.logger.Printf("warning: state hydration failed: %v", err)
 	}
 
-	// 3. Connect MQTT
+	// 3. Connect MQTT (retry until connected or ctx cancelled)
 	b.mqtt = NewMQTTClient(b.cfg.MQTT, b.cfg.HA.DiscoveryPrefix)
-	if err := b.mqtt.Connect(ctx); err != nil {
-		return fmt.Errorf("mqtt connect: %w", err)
+	for {
+		if err := b.mqtt.Connect(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			b.logger.Printf("mqtt connect failed: %v (retrying in 10s)", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(10 * time.Second):
+				continue
+			}
+		}
+		break
 	}
 
 	// 4. Publish discovery + initial state

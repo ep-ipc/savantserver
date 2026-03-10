@@ -49,8 +49,10 @@ func NewMQTTClient(cfg MQTTConfig, haPrefix string) *MQTTClient {
 	// Last Will and Testament — broker publishes "offline" if we disconnect unexpectedly
 	opts.SetWill(statusTopic, "offline", 1, true)
 
-	opts.SetOnConnectHandler(func(_ mqtt.Client) {
+	opts.SetOnConnectHandler(func(c mqtt.Client) {
 		logger.Println("MQTT connected")
+		// Re-publish online status after every reconnect so HA sees us as available
+		c.Publish(statusTopic, 1, true, "online")
 	})
 	opts.SetConnectionLostHandler(func(_ mqtt.Client, err error) {
 		logger.Printf("MQTT connection lost: %v", err)
@@ -119,7 +121,7 @@ func (m *MQTTClient) PublishState(entity *LightEntity, state LightState) error {
 		return fmt.Errorf("building state payload for %s: %w", entity.UniqueID, err)
 	}
 	topic := entity.StateTopic(m.topicPrefix)
-	token := m.client.Publish(topic, 0, false, payload)
+	token := m.client.Publish(topic, 0, true, payload)
 	token.Wait()
 	return token.Error()
 }

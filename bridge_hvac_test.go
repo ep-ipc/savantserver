@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestHandleClimateCommand_Mode(t *testing.T) {
@@ -96,12 +97,67 @@ func newTestBridgeWithThermostat(t *testing.T) *Bridge {
 		e := &b.thermostats[i]
 		b.thermostatState[e.UniqueID] = &ThermostatState{Mode: "off", FanMode: "auto"}
 		b.thermostatIdx[e.RoomSlug+"/"+e.EntitySlug] = e
-		if e.ThermostatAddr >= 0 {
-			b.thermostatAddrIdx[e.ThermostatAddr] = e
-		}
+	}
+	// Kitchen is thermostats[0]; pin avc addr so handleThermostatUpdate tests are deterministic
+	// (all SST-W300 components share address1 "1" in fixtures).
+	if b.thermostats[0].ThermostatAddr >= 0 {
+		b.thermostatAddrIdx[b.thermostats[0].ThermostatAddr] = &b.thermostats[0]
 	}
 
 	return b
+}
+
+func TestApplyAvcThermostatUpdate_JSON(t *testing.T) {
+	b := newTestBridgeWithThermostat(t)
+
+	value := `{"ThermostatCurrentHeatPoint":"72","ThermostatMode":"Heat"}`
+	if !b.applyAvcThermostatUpdate(&b.thermostats[0], value) {
+		t.Fatal("expected JSON avc update to apply")
+	}
+
+	st := b.thermostatState[b.thermostats[0].UniqueID]
+	if st.TemperatureLow == nil || *st.TemperatureLow != 72 {
+		t.Errorf("heat setpoint = %v, want 72", st.TemperatureLow)
+	}
+	if st.Mode != "heat" {
+		t.Errorf("mode = %q, want heat", st.Mode)
+	}
+}
+
+func TestHandleFeedbackStateUpdate(t *testing.T) {
+	b := newTestBridgeWithThermostat(t)
+	b.buildThermostatStateIndex()
+
+	b.handleFeedbackStateUpdate(FeedbackStateUpdate{
+		StateName: "Kitchen Thermostat.HVAC_controller.ThermostatCurrentHeatPoint",
+		Value:     "72",
+	})
+
+	st := b.thermostatState[b.thermostats[0].UniqueID]
+	if st.TemperatureLow == nil || *st.TemperatureLow != 72 {
+		t.Errorf("expected heat setpoint 72, got %v", st.TemperatureLow)
+	}
+}
+
+func TestHandleThermostatUpdate_FallsBackToRefresh(t *testing.T) {
+	apiServer := httptest.NewServer(locationStateHandler(map[string]string{
+		"Kitchen Thermostat.HVAC_controller.ThermostatCurrentHeatPoint": "70",
+		"Kitchen Thermostat.HVAC_controller.ThermostatCurrentCoolPoint": "74",
+		"Kitchen Thermostat.HVAC_controller.ThermostatMode":             "Heat",
+	}, []string{"Kitchen Thermostat.HVAC_controller.ThermostatFanMode"}))
+	defer apiServer.Close()
+
+	b := newTestBridgeWithThermostat(t)
+	b.api = &SavantAPI{baseURL: apiServer.URL, client: apiServer.Client()}
+
+	// Opaque avc value triggers per-entity REST refresh (async in production).
+	b.handleThermostatUpdate(AVCStateUpdate{State: "thermostat.1", Value: "opaque"})
+	time.Sleep(200 * time.Millisecond)
+
+	st := b.thermostatState[b.thermostats[0].UniqueID]
+	if st.TemperatureLow == nil || *st.TemperatureLow != 70 {
+		t.Errorf("expected heat setpoint 70 after refresh, got %v", st.TemperatureLow)
+	}
 }
 
 func TestFetchHvacComponentsIntegration(t *testing.T) {

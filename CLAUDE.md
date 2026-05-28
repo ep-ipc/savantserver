@@ -28,14 +28,16 @@ See `docs/06-design.md` for the full design spec.
 - `hvac.go` — HVAC/thermostat types, state parsing, HA mode mapping
 - `savantapi.go` — REST API client: lights (`BuildEntities`) and HVAC (`BuildThermostatEntities`, `SendHvacCommand`)
 - `avcws.go` — avc WebSocket client (port 8480, `savant_protocol` subprotocol): connect, handshake, subscribe, SetLoad, SimulateButtonPress, ReadLoop
+- `feedbackws.go` — openapi feedback WebSocket (REST port, `/feedback/v1/register`): RegisterStates, ReadLoop for HVAC live state
 - `mqtt.go` — MQTT client for lights: HA discovery, state, commands, LWT
 - `mqtt_climate.go` — MQTT climate discovery and thermostat state/commands
-- `bridge.go` — Orchestrator: lifecycle, lights, avc reconnect
-- `bridge_hvac.go` — Thermostat discovery, hydration, 45s poll, REST command routing
+- `bridge.go` — Orchestrator: lifecycle, lights, avc + feedback reconnect
+- `bridge_hvac.go` — Thermostat discovery, hydration, feedback/avc live state, 8m REST backup poll, commands
 
 **Config:** `config.yaml` (see `docs/06-design.md` for format). Key fields: `savant.config_name` enables per-load state hydration; `mqtt.broker` is required.
 
 **Connections:**
-- avc WebSocket (`ws://127.0.0.1:8480`): hardware control + real-time state subscriptions
-- REST API (`http://127.0.0.1:3062`): config discovery + state hydration
+- avc WebSocket (`ws://127.0.0.1:8480`): lighting control + `module`/`scene`/`thermostat` state subscriptions
+- feedback WebSocket (`ws://127.0.0.1:3062/feedback/v1/register`): HVAC state names (live updates + hydrate on register)
+- REST API (`http://127.0.0.1:3062`): config discovery, HVAC commands, state fallback/backup poll
 - MQTT (`tcp://<broker>:1883`): HA integration (publish state, receive commands, auto-discovery)

@@ -226,7 +226,32 @@ Each Savant HVAC component becomes an HA `climate` entity via MQTT Discovery.
 | `temperature_low` / `temperature_high` | `SetHeatPointTemperature` / `SetCoolPointTemperature` |
 | `target_humidity` | `SetHumiditySetPoint` |
 
-Optimistic MQTT publish on command, then REST PUT, then state refresh (poll or avc `thermostat.*` push).
+Optimistic MQTT publish on command, then REST PUT, then state refresh (feedback WS, avc `thermostat.*` push, or targeted REST).
+
+### Live state (dual path)
+
+```mermaid
+flowchart LR
+  subgraph savant [Savant host]
+    FB[feedback WS :3062]
+    AVC[avc WS :8480]
+    REST[REST :3062]
+  end
+  subgraph bridge [savantserver]
+    B[bridge]
+  end
+  FB -->|StateString updates| B
+  AVC -->|thermostat.* updates| B
+  REST -->|backup poll + post-command| B
+  B --> MQTT[MQTT climate state]
+```
+
+| Path | Role |
+|------|------|
+| **feedback WS** (`feedbackws.go`) | Primary: subscribe to all thermostat state names; hydrate on register |
+| **avc `thermostat` category** | Secondary: inline parse when JSON; else per-entity REST refresh |
+| **REST poll** | Backup every 8 minutes (`thermostatPollLoop`) |
+| **Post-command refresh** | `refreshThermostatStates` after each HVAC PUT |
 
 ## Configuration
 
@@ -261,10 +286,11 @@ When `config_name` is set, state hydration fetches per-load dimmer levels using 
 | `hvac.go` | HVAC/thermostat types, state parsing, mode mapping |
 | `savantapi.go` | REST API client + BuildEntities / BuildThermostatEntities |
 | `avcws.go` | avc WebSocket client (connect, subscribe, send, read loop) |
+| `feedbackws.go` | openapi feedback WebSocket (HVAC state register + updates) |
 | `mqtt.go` | MQTT client for lights (publish, subscribe, LWT, discovery) |
 | `mqtt_climate.go` | MQTT climate discovery, state, command topics |
-| `bridge.go` | Orchestrator (lifecycle, lights, reconnect) |
-| `bridge_hvac.go` | Thermostat discovery, hydration, poll, command routing |
+| `bridge.go` | Orchestrator (lifecycle, lights, avc + feedback reconnect) |
+| `bridge_hvac.go` | Thermostat discovery, hydration, live state, backup poll, commands |
 
 ## Future Work
 
@@ -273,5 +299,5 @@ When `config_name` is set, state hydration fetches per-load dimmer levels using 
 - **Ambient light sensors**: Expose per-device ambient levels. State name format: `<ConfigName>.RacePointMedia_host.CurrentAmbientLevel_<DeviceAddr>`
 - **Exponential backoff**: Add exponential backoff (1s → 2s → 4s → ... → 30s max) for avc WS reconnection failures, rather than waiting for the next 5-minute tick
 - **NNG direct client**: Use go-mangos for ~1ms state reads if latency matters
-- **openapi-go WS**: Could supplement avc WS for room-level subscriptions with auto-hydration
+- **openapi-go WS (lights)**: Room-level lighting state via feedback WS (HVAC already uses it)
 - **REST API auth**: Investigate 402 auth mechanism on PUT endpoints

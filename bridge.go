@@ -19,7 +19,9 @@ type Bridge struct {
 	cfg    *Config
 	api    *SavantAPI
 	avc    *AVCClient
-	avcMu  sync.Mutex   // protects avc client during reconnect
+	avcMu  sync.Mutex // protects avc client during reconnect
+	feedback   *FeedbackClient
+	feedbackMu sync.Mutex // protects feedback client during reconnect
 	mqtt   *MQTTClient
 	logger *log.Logger
 
@@ -29,8 +31,9 @@ type Bridge struct {
 
 	thermostats       []ThermostatEntity
 	thermostatIdx     map[string]*ThermostatEntity // room_slug/entity_slug
-	thermostatAddrIdx map[int]*ThermostatEntity    // thermostat avc address
-	thermostatState   map[string]*ThermostatState  // keyed by UniqueID
+	thermostatAddrIdx   map[int]*ThermostatEntity       // thermostat avc address
+	thermostatStateIdx  map[string][]thermostatStateQuery // savant state name → entity updates
+	thermostatState     map[string]*ThermostatState     // keyed by UniqueID
 
 	state map[string]*LightState // keyed by UniqueID
 	mu    sync.RWMutex           // protects state maps
@@ -98,9 +101,12 @@ func (b *Bridge) Start(ctx context.Context) error {
 		return fmt.Errorf("mqtt subscribe climate commands: %w", err)
 	}
 
-	// 6. Connect avc WebSocket
+	// 6. Connect avc and feedback WebSockets
 	if err := b.connectAVC(ctx); err != nil {
 		return fmt.Errorf("avc connect: %w", err)
+	}
+	if err := b.connectFeedback(ctx); err != nil {
+		b.logger.Printf("warning: feedback connect failed: %v (thermostats will use REST poll)", err)
 	}
 
 	// 7. Start background loops
@@ -109,13 +115,35 @@ func (b *Bridge) Start(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		b.avc.ReadLoop(ctx, b.handleStateUpdate)
+		b.avcMu.Lock()
+		avc := b.avc
+		b.avcMu.Unlock()
+		if avc != nil {
+			avc.ReadLoop(ctx, b.handleStateUpdate)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		b.feedbackMu.Lock()
+		fb := b.feedback
+		b.feedbackMu.Unlock()
+		if fb != nil {
+			fb.ReadLoop(ctx, b.handleFeedbackStateUpdate)
+		}
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		b.reconnectLoop(ctx)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		b.feedbackReconnectLoop(ctx)
 	}()
 
 	wg.Add(1)
@@ -134,6 +162,11 @@ func (b *Bridge) Start(ctx context.Context) error {
 		b.avc.Close()
 	}
 	b.avcMu.Unlock()
+	b.feedbackMu.Lock()
+	if b.feedback != nil {
+		b.feedback.Close()
+	}
+	b.feedbackMu.Unlock()
 	wg.Wait()
 
 	b.logger.Println("stopped")

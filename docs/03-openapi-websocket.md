@@ -87,4 +87,6 @@ The server may become unresponsive after prolonged connections (suspected memory
 | **Hardware control** | No | Yes |
 | **Best for** | Monitoring dashboards, simple reads | Full integration with control |
 
-For the MQTT bridge, we use the **avc WebSocket** instead (see `docs/04-avc-websocket.md`) because it supports both subscriptions and control in a single connection.
+For lighting, the MQTT bridge uses the **avc WebSocket** (see `docs/04-avc-websocket.md`) because it supports both subscriptions and control in a single connection.
+
+**Thermostat live state:** `savantserver` also opens a feedback WebSocket (`feedbackws.go`) to `ws://127.0.0.1:3062/feedback/v1/register` and registers all HVAC `StateString` names from `GET /feedback/v1/states/hvac`. Updates arrive as `feedback/state/update` and are published to MQTT climate topics. The avc connection still subscribes to the `thermostat` category; when pushes are parseable they update state in-process, otherwise a per-entity REST refresh runs. A REST poll every 8 minutes remains as backup.

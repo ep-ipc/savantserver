@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -31,6 +32,7 @@ func (b *Bridge) discoverHvac(ctx context.Context, rooms []Room) error {
 	b.thermostatState = make(map[string]*ThermostatState, len(thermostats))
 	b.thermostatIdx = make(map[string]*ThermostatEntity, len(thermostats))
 	b.thermostatAddrIdx = make(map[int]*ThermostatEntity, len(thermostats))
+	b.buildThermostatStateIndex()
 
 	for i := range b.thermostats {
 		e := &b.thermostats[i]
@@ -43,6 +45,14 @@ func (b *Bridge) discoverHvac(ctx context.Context, rooms []Room) error {
 
 	b.logger.Printf("discovered %d hvac components → %d thermostats", len(components), len(thermostats))
 	return nil
+}
+
+func (b *Bridge) buildThermostatStateIndex() {
+	_, updates := b.thermostatStateQueries()
+	b.thermostatStateIdx = make(map[string][]thermostatStateQuery, len(updates))
+	for _, u := range updates {
+		b.thermostatStateIdx[u.stateName] = append(b.thermostatStateIdx[u.stateName], u)
+	}
 }
 
 func (b *Bridge) hydrateThermostats(ctx context.Context) error {
@@ -139,11 +149,15 @@ func (b *Bridge) refreshThermostatStates(ctx context.Context) {
 	}
 }
 
+const thermostatPollInterval = 8 * time.Minute
+const feedbackReconnectInterval = 8 * time.Minute
+
 func (b *Bridge) thermostatPollLoop(ctx context.Context) {
 	if len(b.thermostats) == 0 {
 		return
 	}
-	ticker := time.NewTicker(45 * time.Second)
+	b.logger.Printf("thermostat REST backup poll every %s", thermostatPollInterval)
+	ticker := time.NewTicker(thermostatPollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -156,6 +170,96 @@ func (b *Bridge) thermostatPollLoop(ctx context.Context) {
 	}
 }
 
+func (b *Bridge) connectFeedback(ctx context.Context) error {
+	if len(b.thermostats) == 0 {
+		return nil
+	}
+
+	client := NewFeedbackClient(b.cfg.Savant.Host, b.cfg.Savant.RESTPort)
+	if err := client.Connect(ctx); err != nil {
+		return err
+	}
+
+	stateNames, _ := b.thermostatStateQueries()
+	if err := client.RegisterStates(stateNames); err != nil {
+		client.Close()
+		return err
+	}
+
+	b.feedbackMu.Lock()
+	b.feedback = client
+	b.feedbackMu.Unlock()
+	return nil
+}
+
+func (b *Bridge) feedbackReconnectLoop(ctx context.Context) {
+	if len(b.thermostats) == 0 {
+		return
+	}
+	ticker := time.NewTicker(feedbackReconnectInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.logger.Println("periodic feedback reconnect")
+
+			b.feedbackMu.Lock()
+			old := b.feedback
+			b.feedbackMu.Unlock()
+			if old != nil {
+				old.Close()
+			}
+
+			if err := b.connectFeedback(ctx); err != nil {
+				b.logger.Printf("feedback reconnect failed: %v (will retry in %s)", err, feedbackReconnectInterval)
+				continue
+			}
+
+			b.feedbackMu.Lock()
+			fb := b.feedback
+			b.feedbackMu.Unlock()
+			go fb.ReadLoop(ctx, b.handleFeedbackStateUpdate)
+		}
+	}
+}
+
+func (b *Bridge) handleFeedbackStateUpdate(update FeedbackStateUpdate) {
+	queries, ok := b.thermostatStateIdx[update.StateName]
+	if !ok || len(queries) == 0 {
+		return
+	}
+
+	changedEntities := make(map[string]bool)
+	b.mu.Lock()
+	for _, q := range queries {
+		st := b.thermostatState[q.entity.UniqueID]
+		applyHvacStateValue(q.entity, q.logicalKey, update.Value, st)
+		finalizeThermostatState(st)
+		changedEntities[q.entity.UniqueID] = true
+	}
+	b.mu.Unlock()
+
+	if b.mqtt == nil {
+		return
+	}
+	for uid := range changedEntities {
+		for i := range b.thermostats {
+			e := &b.thermostats[i]
+			if e.UniqueID != uid {
+				continue
+			}
+			st := b.thermostatState[uid]
+			if err := b.mqtt.PublishThermostatState(e, *st); err != nil {
+				b.logger.Printf("publish climate state error for %s: %v", uid, err)
+			}
+			break
+		}
+	}
+}
+
 func (b *Bridge) handleThermostatUpdate(update AVCStateUpdate) {
 	addrStr := strings.TrimPrefix(update.State, "thermostat.")
 	addr, err := strconv.ParseInt(addrStr, 0, 64)
@@ -163,13 +267,129 @@ func (b *Bridge) handleThermostatUpdate(update AVCStateUpdate) {
 		return
 	}
 
-	if _, ok := b.thermostatAddrIdx[int(addr)]; !ok {
+	entity, ok := b.thermostatAddrIdx[int(addr)]
+	if !ok {
 		return
 	}
 
-	b.logger.Printf("thermostat update %s = %s (addr %d)", update.State, update.Value, addr)
-	// avc thermostat push format is not documented; trigger a full REST refresh.
-	go b.refreshThermostatStates(context.Background())
+	b.logger.Printf("thermostat update %s = %q (addr %d)", update.State, update.Value, addr)
+	if b.applyAvcThermostatUpdate(entity, update.Value) {
+		return
+	}
+	go b.refreshThermostatForEntity(context.Background(), entity)
+}
+
+// applyAvcThermostatUpdate tries to parse an avc thermostat push value in-place.
+// Returns true if the update was applied and published.
+func (b *Bridge) applyAvcThermostatUpdate(entity *ThermostatEntity, value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "X" || value == "-1" {
+		return false
+	}
+
+	// Some firmware may send a JSON object; try that first.
+	var fields map[string]any
+	if strings.HasPrefix(value, "{") {
+		if err := json.Unmarshal([]byte(value), &fields); err == nil {
+			return b.applyAvcThermostatFields(entity, fields)
+		}
+	}
+
+	// Undocumented binary/text formats: not handled here.
+	return false
+}
+
+func (b *Bridge) applyAvcThermostatFields(entity *ThermostatEntity, fields map[string]any) bool {
+	changed := false
+	b.mu.Lock()
+	st := b.thermostatState[entity.UniqueID]
+	for key, raw := range fields {
+		logicalKey, ok := mapAvcFieldToLogicalKey(key)
+		if !ok {
+			continue
+		}
+		applyHvacStateValue(entity, logicalKey, formatStateValue(raw), st)
+		changed = true
+	}
+	if changed {
+		finalizeThermostatState(st)
+	}
+	snapshot := *st
+	b.mu.Unlock()
+
+	if !changed || b.mqtt == nil {
+		return changed
+	}
+	if err := b.mqtt.PublishThermostatState(entity, snapshot); err != nil {
+		b.logger.Printf("publish climate state error for %s: %v", entity.UniqueID, err)
+	}
+	return changed
+}
+
+func mapAvcFieldToLogicalKey(field string) (string, bool) {
+	switch strings.ToLower(field) {
+	case "mode", "thermostatmode":
+		return hvacStateMode, true
+	case "fanmode", "thermostatfanmode":
+		return hvacStateFanMode, true
+	case "currenttemperature", "thermostatcurrenttemperature":
+		return hvacStateCurrentTemp, true
+	case "heatpoint", "thermostatcurrentheatpoint":
+		return hvacStateHeatSetpoint, true
+	case "coolpoint", "thermostatcurrentcoolpoint":
+		return hvacStateCoolSetpoint, true
+	default:
+		return "", false
+	}
+}
+
+func (b *Bridge) refreshThermostatForEntity(ctx context.Context, entity *ThermostatEntity) {
+	var stateNames []string
+	var updates []thermostatStateQuery
+	for logicalKey, stateName := range entity.StateNames {
+		if stateName == "" {
+			continue
+		}
+		stateNames = append(stateNames, stateName)
+		updates = append(updates, thermostatStateQuery{
+			stateName:  stateName,
+			logicalKey: logicalKey,
+			entity:     entity,
+		})
+	}
+	if len(stateNames) == 0 {
+		return
+	}
+
+	states, err := b.api.FetchStates(ctx, stateNames)
+	if err != nil {
+		b.logger.Printf("thermostat refresh for %s failed: %v", entity.Name, err)
+		return
+	}
+
+	changed := false
+	b.mu.Lock()
+	st := b.thermostatState[entity.UniqueID]
+	before := *st
+	for _, u := range updates {
+		val, ok := states[u.stateName]
+		if !ok {
+			continue
+		}
+		applyHvacStateValue(u.entity, u.logicalKey, val, st)
+	}
+	finalizeThermostatState(st)
+	if *st != before {
+		changed = true
+	}
+	snapshot := *st
+	b.mu.Unlock()
+
+	if changed && b.mqtt != nil {
+		if err := b.mqtt.PublishThermostatState(entity, snapshot); err != nil {
+			b.logger.Printf("publish climate state error for %s: %v", entity.UniqueID, err)
+		}
+	}
 }
 
 func (b *Bridge) handleClimateCommand(entityID string, cmd ClimateCommand) {

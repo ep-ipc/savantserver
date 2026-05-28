@@ -1,0 +1,16 @@
+[
+  {
+    "comment": "Live avc thermostat.* push format not confirmed on-host; opaque values trigger per-entity REST refresh.",
+    "state": "thermostat.1",
+    "value": ""
+  },
+  {
+    "state": "thermostat.1",
+    "value": "1"
+  },
+  {
+    "comment": "If firmware sends JSON, applyAvcThermostatUpdate maps these keys",
+    "state": "thermostat.1",
+    "value": "{\"ThermostatCurrentHeatPoint\":\"72\",\"ThermostatMode\":\"Heat\"}"
+  }
+]

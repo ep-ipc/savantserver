@@ -38,13 +38,36 @@ func newTestServer(t *testing.T) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(loadFixture(t, "device_with_buttons.json"))
 	})
-	mux.HandleFunc("/states/", func(w http.ResponseWriter, r *http.Request) {
-		stateName := r.URL.Path[len("/states/"):]
-		w.Header().Set("Content-Type", "application/json")
-		resp := map[string][]string{"data": {stateName + "_value"}}
-		json.NewEncoder(w).Encode(resp)
-	})
+	mux.HandleFunc("/config/v1/location/state", locationStateHandler(nil, nil))
 	return httptest.NewServer(mux)
+}
+
+// locationStateHandler mocks GET /config/v1/location/state?state=...
+// values maps state name → value string; noValue states return HTTP 500 "no value".
+func locationStateHandler(values map[string]string, noValue []string) http.HandlerFunc {
+	noValueSet := make(map[string]bool, len(noValue))
+	for _, name := range noValue {
+		noValueSet[name] = true
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		stateName := r.URL.Query().Get("state")
+		w.Header().Set("Content-Type", "application/json")
+		if noValueSet[stateName] {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "state requested had no value"})
+			return
+		}
+		val := stateName + "_value"
+		if values != nil {
+			if v, ok := values[stateName]; ok {
+				val = v
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"state": stateName,
+			"value": val,
+		})
+	}
 }
 
 func apiFromTestServer(ts *httptest.Server) *SavantAPI {
@@ -145,6 +168,58 @@ func TestFetchState(t *testing.T) {
 	}
 	if val != "Den.BrightnessLevel_value" {
 		t.Errorf("state value = %s, want Den.BrightnessLevel_value", val)
+	}
+}
+
+func TestFetchState_NoValue(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(
+		locationStateHandler(nil, []string{"Den.MissingState"}),
+	))
+	defer ts.Close()
+	api := apiFromTestServer(ts)
+
+	val, err := api.FetchState(context.Background(), "Den.MissingState")
+	if err != nil {
+		t.Fatalf("FetchState error: %v", err)
+	}
+	if val != "" {
+		t.Errorf("state value = %q, want empty", val)
+	}
+}
+
+func TestFetchState_NumericValue(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(
+		locationStateHandler(map[string]string{
+			"Den.BrightnessLevel": "75",
+		}, nil),
+	))
+	defer ts.Close()
+	api := apiFromTestServer(ts)
+
+	val, err := api.FetchState(context.Background(), "Den.BrightnessLevel")
+	if err != nil {
+		t.Fatalf("FetchState error: %v", err)
+	}
+	if val != "75" {
+		t.Errorf("state value = %q, want 75", val)
+	}
+}
+
+func TestFormatStateValue(t *testing.T) {
+	tests := []struct {
+		in   any
+		want string
+	}{
+		{"95", "95"},
+		{float64(72), "72"},
+		{true, "1"},
+		{false, "0"},
+		{nil, ""},
+	}
+	for _, tc := range tests {
+		if got := formatStateValue(tc.in); got != tc.want {
+			t.Errorf("formatStateValue(%v) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

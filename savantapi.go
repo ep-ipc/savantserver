@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -67,19 +71,108 @@ func (s *SavantAPI) FetchDevice(ctx context.Context, deviceID string) (*Device, 
 	return &device, nil
 }
 
-// FetchState reads a single state value by name.
+// FetchHvacComponents retrieves all HVAC components from the Savant REST API.
+func (s *SavantAPI) FetchHvacComponents(ctx context.Context, roomID string) ([]HvacComponent, error) {
+	path := "/config/v1/hvac/components"
+	if roomID != "" {
+		path += "?RoomID=" + url.QueryEscape(roomID)
+	}
+	var components []HvacComponent
+	if err := s.getJSON(ctx, path, &components); err != nil {
+		return nil, fmt.Errorf("fetching hvac components: %w", err)
+	}
+	return components, nil
+}
+
+// FetchHvacFeedbackStates retrieves HVAC state name metadata from the feedback API.
+func (s *SavantAPI) FetchHvacFeedbackStates(ctx context.Context) (*HvacFeedbackResponse, error) {
+	var resp HvacFeedbackResponse
+	if err := s.getJSON(ctx, "/feedback/v1/states/hvac", &resp); err != nil {
+		return nil, fmt.Errorf("fetching hvac feedback states: %w", err)
+	}
+	return &resp, nil
+}
+
+// SendHvacCommand issues an HVAC control command via REST PUT.
+func (s *SavantAPI) SendHvacCommand(ctx context.Context, deviceID, command string, args map[string]any) error {
+	body := map[string]any{
+		"command": command,
+	}
+	if len(args) > 0 {
+		body["arguments"] = args
+	}
+	path := fmt.Sprintf("/config/v1/hvac/components/%s/command", url.PathEscape(deviceID))
+	if err := s.putJSON(ctx, path, body); err != nil {
+		return fmt.Errorf("hvac command %s for %s: %w", command, deviceID, err)
+	}
+	return nil
+}
+
+// stateValueResponse is the GET /config/v1/location/state response body.
+type stateValueResponse struct {
+	State string `json:"state"`
+	Value any    `json:"value"`
+}
+
+// FetchState reads a single state value by name from StateCenter via the v1 REST API.
 func (s *SavantAPI) FetchState(ctx context.Context, stateName string) (string, error) {
-	var resp struct {
-		Data []string `json:"data"`
+	path := "/config/v1/location/state?state=" + url.QueryEscape(stateName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+path, nil)
+	if err != nil {
+		return "", fmt.Errorf("creating request: %w", err)
 	}
-	path := fmt.Sprintf("/states/%s", stateName)
-	if err := s.getJSON(ctx, path, &resp); err != nil {
-		return "", fmt.Errorf("fetching state %s: %w", stateName, err)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("executing request: %w", err)
 	}
-	if len(resp.Data) == 0 {
-		return "", nil
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading response: %w", err)
 	}
-	return resp.Data[0], nil
+
+	if resp.StatusCode == http.StatusInternalServerError {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(body, &errResp) == nil && strings.Contains(errResp.Error, "no value") {
+			return "", nil
+		}
+		return "", fmt.Errorf("fetching state %s: status %d: %s", stateName, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetching state %s: status %d: %s", stateName, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var stateResp stateValueResponse
+	if err := json.Unmarshal(body, &stateResp); err != nil {
+		return "", fmt.Errorf("decoding state %s: %w", stateName, err)
+	}
+	return formatStateValue(stateResp.Value), nil
+}
+
+func formatStateValue(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch x := v.(type) {
+	case string:
+		return x
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case bool:
+		if x {
+			return "1"
+		}
+		return "0"
+	case json.Number:
+		return x.String()
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 // FetchStates reads multiple state values concurrently.
@@ -145,6 +238,105 @@ func (s *SavantAPI) getJSON(ctx context.Context, path string, dest interface{}) 
 		return fmt.Errorf("decoding response: %w", err)
 	}
 	return nil
+}
+
+// putJSON performs a PUT request with a JSON body.
+func (s *SavantAPI) putJSON(ctx context.Context, path string, body any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshaling request body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.baseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("executing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %d for %s", resp.StatusCode, path)
+	}
+	return nil
+}
+
+// BuildThermostatEntities joins rooms, HVAC components, and feedback into ThermostatEntity values.
+func BuildThermostatEntities(rooms []Room, components []HvacComponent, feedback *HvacFeedbackResponse) ([]ThermostatEntity, error) {
+	roomMap := make(map[string]Room, len(rooms))
+	for _, r := range rooms {
+		roomMap[r.RoomID] = r
+	}
+
+	entities := make([]ThermostatEntity, 0, len(components))
+	for _, comp := range components {
+		room, ok := roomMap[comp.RoomID]
+		if !ok {
+			return nil, fmt.Errorf("room %s not found for hvac component %s", comp.RoomID, comp.Name)
+		}
+
+		var fb *HvacThermostatFeedback
+		if feedback != nil {
+			if entry, ok := feedback.Thermostats[comp.Name]; ok {
+				fb = &entry
+			}
+		}
+
+		stateNames := buildHvacStateNames(fb)
+		if len(stateNames) == 0 {
+			continue
+		}
+
+		modes := []string{"off"}
+		if comp.HeatControlSupported {
+			modes = append(modes, "heat")
+		}
+		if comp.CoolControlSupported {
+			modes = append(modes, "cool")
+		}
+		if comp.AutoControlSupported {
+			modes = append(modes, "heat_cool")
+		}
+
+		fanModes := []string{"auto", "on", "circulate"}
+
+		addr := parseThermostatAddress(comp.Address1)
+		addr2 := parseThermostatAddress(comp.Address2)
+		if fb != nil && len(fb.ThermostatAddresses) > 0 {
+			if a := parseThermostatAddress(fb.ThermostatAddresses[0].ThermostatAddress); a >= 0 {
+				addr = a
+			}
+			if a := parseThermostatAddress(fb.ThermostatAddresses[0].ThermostatAddress2); a >= 0 {
+				addr2 = a
+			}
+		}
+
+		uniqueID := "savant_hvac_" + strings.ToLower(strings.ReplaceAll(comp.DeviceID, "-", "_"))
+
+		entity := ThermostatEntity{
+			UniqueID:         uniqueID,
+			Name:             comp.Name,
+			RoomName:         room.Name,
+			RoomSlug:         Slugify(room.Name),
+			EntitySlug:       Slugify(comp.Name),
+			DeviceID:         comp.DeviceID,
+			DeviceModel:      comp.Model,
+			Manufacturer:     comp.Manufacturer,
+			ThermostatAddr:   addr,
+			ThermostatAddr2:  addr2,
+			Modes:            modes,
+			FanModes:         fanModes,
+			SupportsHumidity: comp.HumiditySupported,
+			StateNames:       stateNames,
+		}
+		entities = append(entities, entity)
+	}
+
+	return entities, nil
 }
 
 // BuildEntities transforms rooms, loads, and devices into LightEntity values

@@ -36,21 +36,66 @@ For `savantserver` running on the host, use port 3062 directly.
 | GET | `/config/v1/hvac/components` | HVAC components |
 | GET | `/config/v1/shades/groups` | Shade groups |
 
+### HVAC Endpoints
+
+| Method | Endpoint | Returns / Action |
+|--------|----------|----------------|
+| GET | `/config/v1/hvac/components` | HVAC thermostat components (deviceID, roomID, capabilities) |
+| GET | `/config/v1/hvac/components?RoomID={id}` | Components filtered by room |
+| GET | `/feedback/v1/states/hvac` | Per-thermostat state name index (`Thermostats` map keyed by component name) |
+| PUT | `/config/v1/hvac/components/{DeviceID}/command` | Issue HVAC command (see below) |
+
+HVAC command body:
+
+```json
+{"command": "SetHVACModeHeat", "arguments": {}}
+{"command": "SetHeatPointTemperature", "arguments": {"HeatPointTemperature": 72}}
+{"command": "SetCoolPointTemperature", "arguments": {"CoolPointTemperature": 74}}
+{"command": "SetHumiditySetPoint", "arguments": {"HumidityPoint": 45}}
+```
+
+Commands include `SetHVACModeOff`, `SetHVACModeHeat`, `SetHVACModeCool`, `SetHVACModeAuto`, `SetFanModeAuto`, `SetFanModeOn`, `SetFanModeCycle`, and humidity commands. Unlike lighting `POST /control/v1/...` endpoints, this **config-hvac PUT** path is used by `savantserver` for thermostat control.
+
+Example thermostat state names (from feedback):
+
+```
+1st Floor Guest Thermostat.HVAC_controller.ThermostatMode
+1st Floor Guest Thermostat.HVAC_controller.ThermostatCurrentHeatPoint
+1st Floor Guest Thermostat.HVAC_controller.ThermostatCurrentCoolPoint
+1st Floor Guest Thermostat.HVAC_controller.ThermostatCurrentTemperature
+```
+
 ## State Endpoints
+
+### Read state (use this)
 
 | Method | Endpoint | Returns |
 |--------|----------|---------|
-| GET | `/states/{stateName}` | `{"data":["<value>"]}` |
-| GET | `/states/registered` | List of registered state subscriptions |
+| GET | `/config/v1/location/state?state={name}` | `{"state":"<name>","value":"<value>"}` from StateCenter |
 
-State name format: `<RoomName>.<PropertyName>` (e.g., `Den.BrightnessLevel`).
+State names can contain spaces — pass them as the `state` query parameter (URL-encoded). The `value` field may be a string or number.
 
 Examples:
 ```
-GET /states/Den.BrightnessLevel        → {"data":["95"]}
-GET /states/Living.RoomLightsAreOn     → {"data":["0"]}
-GET /states/Den.NumberOfLightsOn       → {"data":["1"]}
+GET /config/v1/location/state?state=Den.BrightnessLevel
+  → {"state":"Den.BrightnessLevel","value":"95"}
+
+GET /config/v1/location/state?state=1st%20Floor%20Guest%20Thermostat.HVAC_controller.ThermostatCurrentHeatPoint
+  → {"state":"1st Floor Guest Thermostat.HVAC_controller.ThermostatCurrentHeatPoint","value":"72"}
 ```
+
+If a state has no current value, the API returns HTTP 500 with `{"error":"state requested had no value"}`. `savantserver` treats that as an empty value.
+
+`savantserver` uses this endpoint for light hydration and thermostat state reads.
+
+### Legacy state endpoints (avoid)
+
+| Method | Endpoint | Notes |
+|--------|----------|-------|
+| GET | `/states/{stateName}` | **legacy-states** — often returns **502** on external port 3060 via nginx |
+| GET | `/states/registered` | Registered state subscriptions (legacy) |
+
+State name format: `<RoomName>.<PropertyName>` or `<ComponentName>.HVAC_controller.<Property>` for thermostats.
 
 ## System Endpoints
 
@@ -73,7 +118,9 @@ GET /states/Den.NumberOfLightsOn       → {"data":["1"]}
 | POST | `/control/v1/lighting/scenes/{id}/apply` | Returns success, no effect |
 | PUT | `/control/lighting/...` | HTTP 402 |
 
-For hardware control, use the avc WebSocket (port 8480) — see `docs/04-avc-websocket.md`.
+For **lighting** hardware control, use the avc WebSocket (port 8480) — see `docs/04-avc-websocket.md`.
+
+For **HVAC**, use `PUT /config/v1/hvac/components/{DeviceID}/command` (REST). The bridge also subscribes to avc `thermostat` state updates when available, and polls REST state every 45 seconds.
 
 ## Data Models
 

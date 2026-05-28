@@ -24,11 +24,14 @@ See `docs/06-design.md` for the full design spec.
 **Key files:**
 - `main.go` — Entry point: `-config` flag, signal handling, bridge.Start()
 - `config.go` — YAML config loading with defaults and `MQTT_PASSWORD` env var override
-- `types.go` — All shared types (REST API models, bridge domain types, slug/address helpers)
-- `savantapi.go` — REST API client for discovery (rooms, loads, devices, buttons) + `BuildEntities` joins them into `LightEntity` values
+- `types.go` — Light types and slug/address helpers
+- `hvac.go` — HVAC/thermostat types, state parsing, HA mode mapping
+- `savantapi.go` — REST API client: lights (`BuildEntities`) and HVAC (`BuildThermostatEntities`, `SendHvacCommand`)
 - `avcws.go` — avc WebSocket client (port 8480, `savant_protocol` subprotocol): connect, handshake, subscribe, SetLoad, SimulateButtonPress, ReadLoop
-- `mqtt.go` — MQTT client: HA discovery payloads, state publishing, command subscription, LWT
-- `bridge.go` — Orchestrator: lifecycle (discover → hydrate → MQTT → avc), state cache, command routing, optimistic writes, periodic reconnect
+- `mqtt.go` — MQTT client for lights: HA discovery, state, commands, LWT
+- `mqtt_climate.go` — MQTT climate discovery and thermostat state/commands
+- `bridge.go` — Orchestrator: lifecycle, lights, avc reconnect
+- `bridge_hvac.go` — Thermostat discovery, hydration, 45s poll, REST command routing
 
 **Config:** `config.yaml` (see `docs/06-design.md` for format). Key fields: `savant.config_name` enables per-load state hydration; `mqtt.broker` is required.
 

@@ -94,7 +94,7 @@ See `docs/02-rest-api.md` and `docs/04-avc-websocket.md` for API details.
 ```
 bridge.Start(ctx)
   ├── discover()           — REST → rooms, loads, devices (with buttons)
-  ├── hydrateState()       — REST → batch GET /states/{name} → populate cache
+  ├── hydrateState()       — REST → batch GET /config/v1/location/state → populate cache
   ├── mqttConnect()        — connect with LWT
   ├── publishDiscovery()   — retained HA discovery configs
   ├── publishAvailability() — "online" to savant/status
@@ -187,9 +187,46 @@ For `followDaylight` loads receiving ON (no brightness), the optimistic state pu
 savant/status                                    → "online" / "offline" (LWT)
 savant/<room_slug>/<load_slug>/light/state       → {"state":"ON","brightness":75}
 savant/<room_slug>/<load_slug>/light/set         ← {"state":"ON","brightness":50}
+savant/<room_slug>/<entity_slug>/climate/state   → {"mode":"heat_cool","fan_mode":"auto",...}
+savant/<room_slug>/<entity_slug>/climate/set     ← {"mode":"heat","temperature_low":68,...}
 ```
 
 Slug rules: lowercase, spaces → `_`, apostrophes removed. `Evelyn's Room` → `evelyns_room`.
+
+## Thermostat (HVAC) Entities
+
+Each Savant HVAC component becomes an HA `climate` entity via MQTT Discovery.
+
+### Discovery
+
+- REST: `GET /config/v1/hvac/components` + `GET /feedback/v1/states/hvac`
+- Feedback `Thermostats` map is keyed by component **name** (matches `HvacComponent.name`)
+- State values: `GET /config/v1/location/state?state={StateString}` (query param; spaces URL-encoded)
+
+### HA Climate Mapping
+
+| HA field | Savant source |
+|----------|---------------|
+| `off` / `heat` / `cool` / `heat_cool` | `ThermostatMode` or mode commands |
+| `fan_mode` | `ThermostatFanMode` |
+| `current_temperature` | `ThermostatCurrentTemperature` |
+| `temperature_low` / `temperature_high` | `ThermostatCurrentHeatPoint` / `ThermostatCurrentCoolPoint` |
+| `target_humidity` | `SetHumiditySetPoint` command (humidity mode via `ThermostatHumidityMode`) |
+
+### Command Routing (REST PUT, not avc WS)
+
+| HA command | Savant REST command |
+|------------|---------------------|
+| `mode: off` | `SetHVACModeOff` |
+| `mode: heat` | `SetHVACModeHeat` |
+| `mode: cool` | `SetHVACModeCool` |
+| `mode: heat_cool` | `SetHVACModeAuto` |
+| `fan_mode: auto/on/circulate` | `SetFanModeAuto` / `On` / `Cycle` |
+| `temperature` | `SetHeatPointTemperature` or `SetCoolPointTemperature` (by mode) |
+| `temperature_low` / `temperature_high` | `SetHeatPointTemperature` / `SetCoolPointTemperature` |
+| `target_humidity` | `SetHumiditySetPoint` |
+
+Optimistic MQTT publish on command, then REST PUT, then state refresh (poll or avc `thermostat.*` push).
 
 ## Configuration
 
@@ -220,11 +257,14 @@ When `config_name` is set, state hydration fetches per-load dimmer levels using 
 |------|---------|
 | `main.go` | Entry point: flags, config, signal handling, bridge.Start() |
 | `config.go` | YAML config loading with defaults and env var override |
-| `types.go` | All shared types (REST models, bridge domain types, helpers) |
-| `savantapi.go` | REST API client + entity builder (BuildEntities) |
+| `types.go` | Light types, helpers (Slugify, address math) |
+| `hvac.go` | HVAC/thermostat types, state parsing, mode mapping |
+| `savantapi.go` | REST API client + BuildEntities / BuildThermostatEntities |
 | `avcws.go` | avc WebSocket client (connect, subscribe, send, read loop) |
-| `mqtt.go` | MQTT client (publish, subscribe, LWT, HA discovery payloads) |
-| `bridge.go` | Orchestrator (lifecycle, state cache, command routing, reconnect) |
+| `mqtt.go` | MQTT client for lights (publish, subscribe, LWT, discovery) |
+| `mqtt_climate.go` | MQTT climate discovery, state, command topics |
+| `bridge.go` | Orchestrator (lifecycle, lights, reconnect) |
+| `bridge_hvac.go` | Thermostat discovery, hydration, poll, command routing |
 
 ## Future Work
 

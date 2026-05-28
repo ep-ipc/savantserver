@@ -27,8 +27,13 @@ type Bridge struct {
 	entityIdx map[string]*LightEntity // keyed by "room_slug/load_slug" for command lookup
 	addrIdx   map[int]*LightEntity    // keyed by HexAddr for avc state update lookup
 
+	thermostats       []ThermostatEntity
+	thermostatIdx     map[string]*ThermostatEntity // room_slug/entity_slug
+	thermostatAddrIdx map[int]*ThermostatEntity    // thermostat avc address
+	thermostatState   map[string]*ThermostatState  // keyed by UniqueID
+
 	state map[string]*LightState // keyed by UniqueID
-	mu    sync.RWMutex           // protects state map
+	mu    sync.RWMutex           // protects state maps
 }
 
 // NewBridge creates a new bridge with the given configuration.
@@ -77,6 +82,9 @@ func (b *Bridge) Start(ctx context.Context) error {
 	if err := b.mqtt.PublishDiscovery(b.entities); err != nil {
 		return fmt.Errorf("mqtt publish discovery: %w", err)
 	}
+	if err := b.mqtt.PublishThermostatDiscovery(b.thermostats); err != nil {
+		return fmt.Errorf("mqtt publish thermostat discovery: %w", err)
+	}
 	if err := b.mqtt.PublishAvailability(true); err != nil {
 		return fmt.Errorf("mqtt publish availability: %w", err)
 	}
@@ -85,6 +93,9 @@ func (b *Bridge) Start(ctx context.Context) error {
 	// 5. Subscribe to MQTT commands
 	if err := b.mqtt.SubscribeCommands(b.handleCommand); err != nil {
 		return fmt.Errorf("mqtt subscribe commands: %w", err)
+	}
+	if err := b.mqtt.SubscribeClimateCommands(b.handleClimateCommand); err != nil {
+		return fmt.Errorf("mqtt subscribe climate commands: %w", err)
 	}
 
 	// 6. Connect avc WebSocket
@@ -105,6 +116,12 @@ func (b *Bridge) Start(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		b.reconnectLoop(ctx)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		b.thermostatPollLoop(ctx)
 	}()
 
 	// Block until shutdown
@@ -177,6 +194,10 @@ func (b *Bridge) discover(ctx context.Context) error {
 
 	b.logger.Printf("discovered %d rooms, %d loads → %d entities",
 		len(rooms), len(loads), len(entities))
+
+	if err := b.discoverHvac(ctx, rooms); err != nil {
+		return fmt.Errorf("hvac discovery: %w", err)
+	}
 	return nil
 }
 
@@ -187,10 +208,20 @@ func (b *Bridge) discover(ctx context.Context) error {
 func (b *Bridge) hydrateState(ctx context.Context) error {
 	configName := b.cfg.Savant.ConfigName
 
+	var err error
 	if configName != "" {
-		return b.hydratePerLoad(ctx, configName)
+		err = b.hydratePerLoad(ctx, configName)
+	} else {
+		err = b.hydratePerRoom(ctx)
 	}
-	return b.hydratePerRoom(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := b.hydrateThermostats(ctx); err != nil {
+		return fmt.Errorf("thermostat hydration: %w", err)
+	}
+	return nil
 }
 
 // hydratePerLoad fetches per-load dimmer levels using the state name format:
@@ -307,7 +338,7 @@ func (b *Bridge) connectAVC(ctx context.Context) error {
 		return err
 	}
 
-	if err := client.Subscribe("module", "scene"); err != nil {
+	if err := client.Subscribe("module", "scene", "thermostat"); err != nil {
 		client.Close()
 		return fmt.Errorf("avc subscribe: %w", err)
 	}
@@ -360,6 +391,8 @@ func (b *Bridge) reconnectLoop(ctx context.Context) {
 func (b *Bridge) handleStateUpdate(update AVCStateUpdate) {
 	if strings.HasPrefix(update.State, "module.") {
 		b.handleModuleUpdate(update)
+	} else if strings.HasPrefix(update.State, "thermostat.") {
+		b.handleThermostatUpdate(update)
 	}
 	// scene updates could be handled here in the future
 }
@@ -515,5 +548,10 @@ func (b *Bridge) publishAllStates() {
 			b.logger.Printf("publish state error for %s: %v", e.UniqueID, err)
 		}
 	}
-	b.logger.Printf("published state for %d entities", len(b.entities))
+	b.logger.Printf("published state for %d light entities", len(b.entities))
+
+	if len(b.thermostats) > 0 {
+		b.publishAllThermostatStates()
+		b.logger.Printf("published state for %d thermostats", len(b.thermostats))
+	}
 }

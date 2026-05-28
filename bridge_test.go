@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -298,17 +296,10 @@ func TestHandleCommand_NonDaylightOnSetsMax(t *testing.T) {
 // --- hydrateState tests ---
 
 func TestHydratePerRoom(t *testing.T) {
-	stateServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/states/Den.BrightnessLevel":
-			json.NewEncoder(w).Encode(map[string][]string{"data": {"75"}})
-		case "/states/Den.RoomLightsAreOn":
-			json.NewEncoder(w).Encode(map[string][]string{"data": {"1"}})
-		default:
-			json.NewEncoder(w).Encode(map[string][]string{"data": {"0"}})
-		}
-	}))
+	stateServer := httptest.NewServer(locationStateHandler(map[string]string{
+		"Den.BrightnessLevel":  "75",
+		"Den.RoomLightsAreOn":  "1",
+	}, nil))
 	defer stateServer.Close()
 
 	b := newTestBridge()
@@ -338,16 +329,9 @@ func TestHydratePerRoom(t *testing.T) {
 }
 
 func TestHydratePerLoad(t *testing.T) {
-	stateServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/states/TestConfig.RacePointMedia_host.CurrentDimmerLevel_1_005":
-			// Device 005 has two loads — comma-separated: offset 0 = 80, offset 1 = 0
-			json.NewEncoder(w).Encode(map[string][]string{"data": {"80,0"}})
-		default:
-			json.NewEncoder(w).Encode(map[string][]string{"data": {"0"}})
-		}
-	}))
+	stateServer := httptest.NewServer(locationStateHandler(map[string]string{
+		"TestConfig.RacePointMedia_host.CurrentDimmerLevel_1_005": "80,0",
+	}, nil))
 	defer stateServer.Close()
 
 	b := newTestBridge()
@@ -379,17 +363,10 @@ func TestHydratePerLoad(t *testing.T) {
 }
 
 func TestHydratePerLoadFallsBackToPerRoom(t *testing.T) {
-	stateServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/states/Den.BrightnessLevel":
-			json.NewEncoder(w).Encode(map[string][]string{"data": {"50"}})
-		case "/states/Den.RoomLightsAreOn":
-			json.NewEncoder(w).Encode(map[string][]string{"data": {"1"}})
-		default:
-			json.NewEncoder(w).Encode(map[string][]string{"data": {"0"}})
-		}
-	}))
+	stateServer := httptest.NewServer(locationStateHandler(map[string]string{
+		"Den.BrightnessLevel": "50",
+		"Den.RoomLightsAreOn": "1",
+	}, nil))
 	defer stateServer.Close()
 
 	b := newTestBridge()
@@ -519,16 +496,7 @@ func testLogger() *log.Logger {
 // testStateServer creates an HTTP server that returns per-load dimmer levels.
 func testStateServer(t *testing.T, states map[string]string) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		stateName := r.URL.Path[len("/states/"):]
-		w.Header().Set("Content-Type", "application/json")
-		val, ok := states[stateName]
-		if !ok {
-			val = "0"
-		}
-		resp := map[string][]string{"data": {val}}
-		json.NewEncoder(w).Encode(resp)
-	}))
+	return httptest.NewServer(locationStateHandler(states, nil))
 }
 
 // Verify bridge.Start log line format includes required info
